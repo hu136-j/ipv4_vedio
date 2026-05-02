@@ -226,7 +226,13 @@ int main(int argc, char *argv[])
 
     for (i = 0; i < channel_count; i++)
     {
-        tbf_arr[i] = token_init(12288, 20000);
+        uint32_t audio_rate = chanal_buff[i]->bitrate_bytes_per_sec;
+        uint32_t burst = audio_rate;
+
+        if (burst < AUDIO_CHUNK_SIZE)
+            burst = AUDIO_CHUNK_SIZE;
+
+        tbf_arr[i] = token_init(burst, audio_rate);
         if (tbf_arr[i] == NULL)
         {
             fprintf(stderr, "token_init failed for chanal %d\n", i + 1);

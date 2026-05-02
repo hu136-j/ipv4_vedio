@@ -13,6 +13,10 @@
 
 #include "meduim.h"
 
+#define DEFAULT_AUDIO_BYTES_PER_SEC 12000U
+#define MIN_AUDIO_BYTES_PER_SEC      4000U
+#define MAX_AUDIO_BYTES_PER_SEC      64000U
+
 struct chanal_st *chanal_buff[CHANAL_NUM] = { NULL };
 struct listentry_st *list_buff[CHANAL_NUM] = { NULL };
 struct token_entyr *tbf_arr[CHANAL_NUM] = { NULL };
@@ -58,6 +62,126 @@ static struct listentry_st *alloc_listentry(uint8_t channel_id, const char *name
     return entry;
 }
 
+static uint32_t clamp_audio_rate(uint32_t bytes_per_sec)
+{
+    if (bytes_per_sec < MIN_AUDIO_BYTES_PER_SEC)
+        return MIN_AUDIO_BYTES_PER_SEC;
+
+    if (bytes_per_sec > MAX_AUDIO_BYTES_PER_SEC)
+        return MAX_AUDIO_BYTES_PER_SEC;
+
+    return bytes_per_sec;
+}
+
+static uint32_t bitrate_kbps_to_bytes_per_sec(uint32_t bitrate_kbps)
+{
+    if (bitrate_kbps == 0)
+        return DEFAULT_AUDIO_BYTES_PER_SEC;
+
+    return clamp_audio_rate((bitrate_kbps * 1000U) / 8U);
+}
+
+static uint32_t parse_mp3_bitrate_bytes_per_sec(const char *audio_path)
+{
+    static const int bitrate_table[2][3][16] = {
+        {
+            { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 },
+            { 0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0 },
+            { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 }
+        },
+        {
+            { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 },
+            { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 },
+            { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 0 }
+        }
+    };
+    int fd;
+    unsigned char buf[10];
+    ssize_t nread;
+    off_t offset = 0;
+    uint32_t header;
+    int version_id;
+    int layer_bits;
+    int bitrate_index;
+    int version_group;
+    int layer_index;
+    int bitrate_kbps;
+
+    if (audio_path == NULL)
+        return DEFAULT_AUDIO_BYTES_PER_SEC;
+
+    fd = open(audio_path, O_RDONLY);
+    if (fd < 0)
+        return DEFAULT_AUDIO_BYTES_PER_SEC;
+
+    nread = read(fd, buf, sizeof(buf));
+    if (nread == (ssize_t)sizeof(buf) &&
+        memcmp(buf, "ID3", 3) == 0)
+    {
+        offset = 10 +
+                 ((off_t)(buf[6] & 0x7f) << 21) +
+                 ((off_t)(buf[7] & 0x7f) << 14) +
+                 ((off_t)(buf[8] & 0x7f) << 7) +
+                 (off_t)(buf[9] & 0x7f);
+    }
+
+    if (lseek(fd, offset, SEEK_SET) < 0)
+    {
+        close(fd);
+        return DEFAULT_AUDIO_BYTES_PER_SEC;
+    }
+
+    while (1)
+    {
+        nread = read(fd, buf, 4);
+        if (nread < 4)
+            break;
+
+        header = ((uint32_t)buf[0] << 24) |
+                 ((uint32_t)buf[1] << 16) |
+                 ((uint32_t)buf[2] << 8) |
+                 (uint32_t)buf[3];
+
+        if ((header & 0xffe00000U) != 0xffe00000U)
+        {
+            if (lseek(fd, -3, SEEK_CUR) < 0)
+                break;
+            continue;
+        }
+
+        version_id = (int)((header >> 19) & 0x3U);
+        layer_bits = (int)((header >> 17) & 0x3U);
+        bitrate_index = (int)((header >> 12) & 0xfU);
+
+        if (version_id == 1 || layer_bits == 0 || bitrate_index == 0 || bitrate_index == 15)
+        {
+            if (lseek(fd, -3, SEEK_CUR) < 0)
+                break;
+            continue;
+        }
+
+        version_group = (version_id == 3) ? 0 : 1;
+
+        if (layer_bits == 3)
+            layer_index = 0;
+        else if (layer_bits == 2)
+            layer_index = 1;
+        else
+            layer_index = 2;
+
+        bitrate_kbps = bitrate_table[version_group][layer_index][bitrate_index];
+        close(fd);
+
+        if (bitrate_kbps <= 0)
+            return DEFAULT_AUDIO_BYTES_PER_SEC;
+
+        return bitrate_kbps_to_bytes_per_sec((uint32_t)bitrate_kbps);
+    }
+
+    close(fd);
+    return DEFAULT_AUDIO_BYTES_PER_SEC;
+}
+
 static struct chanal_st *alloc_channel(uint8_t channel_id, const char *audio_path)
 {
     size_t path_len;
@@ -76,6 +200,7 @@ static struct chanal_st *alloc_channel(uint8_t channel_id, const char *audio_pat
 
     memset(channel, 0, sizeof(*channel) + path_len);
     channel->chanal_id = channel_id;
+    channel->bitrate_bytes_per_sec = parse_mp3_bitrate_bytes_per_sec(audio_path);
     channel->game_len = (uint32_t)path_len;
     memcpy(channel->game, audio_path, path_len);
     channel->game[path_len] = '\0';
@@ -168,6 +293,10 @@ static int load_channel_dir(const char *dir_path, uint8_t channel_id)
 
     chanal_buff[channel_id - 1] = channel;
     list_buff[channel_id - 1] = entry;
+
+    fprintf(stderr,
+            "loaded channel %u: %s, rate=%u B/s\n",
+            channel_id, audio_name, channel->bitrate_bytes_per_sec);
 
     globfree(&glob_res);
     return 1;

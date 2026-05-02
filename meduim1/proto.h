@@ -27,6 +27,7 @@ struct chanal_st
     uint8_t  chanal_id;
     uint16_t desc_len;
     char     desc[DESC_MAX];
+    uint32_t bitrate_bytes_per_sec;
     uint32_t game_len;
     char     game[1];
 } __attribute__((packed));
@@ -60,4 +61,3 @@ struct list_st
 #define NET_AUDIO_HDR_LEN  12  /* chanal_id(1) + pkt_type(1) + stream_epoch(4) + seq(4) + payload_len(2) */
 
 #endif
-
