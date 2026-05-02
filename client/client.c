@@ -22,6 +22,8 @@
 #include "config.h"
 #include "logger.h"
 #include "heartbeat.h"
+#include "resource_monitor.h"
+#include "watchdog.h"
 
 #define MODULE_NAME "client"
 
@@ -94,6 +96,18 @@ struct optentry
     int heartbeat_check_interval;
     int max_reconnect_attempts;
     int reconnect_delay_ms;
+    /* 资源监控配置 */
+    int enable_resource_monitor;
+    int resource_sample_interval_ms;
+    float resource_cpu_critical;
+    float resource_cpu_low;
+    float resource_mem_critical;
+    float resource_mem_low;
+    /* 看门狗配置 */
+    int enable_watchdog;
+    const char *watchdog_device;
+    int watchdog_timeout_sec;
+    int watchdog_feed_interval_ms;
 };
 
 struct fd_ctx
@@ -148,6 +162,10 @@ static int g_current_channel = 0;
 static int g_desc_printed = 0;
 static int g_list_announced = 0;
 static volatile sig_atomic_t g_stop = 0;
+
+/* 资源监控和看门狗 */
+static resource_monitor_t *g_resource_monitor = NULL;
+static watchdog_t *g_watchdog = NULL;
 
 static void signal_handler(int signo)
 {
@@ -1285,6 +1303,18 @@ static int parse_args(int argc, char *argv[], struct optentry *opt, const char *
     opt->heartbeat_check_interval = 500;
     opt->max_reconnect_attempts = 0;
     opt->reconnect_delay_ms = 2000;
+    /* 资源监控默认配置 */
+    opt->enable_resource_monitor = 0;
+    opt->resource_sample_interval_ms = 1000;
+    opt->resource_cpu_critical = 90.0f;
+    opt->resource_cpu_low = 70.0f;
+    opt->resource_mem_critical = 90.0f;
+    opt->resource_mem_low = 75.0f;
+    /* 看门狗默认配置 */
+    opt->enable_watchdog = 0;
+    opt->watchdog_device = "/dev/watchdog";
+    opt->watchdog_timeout_sec = 30;
+    opt->watchdog_feed_interval_ms = 10000;
 
     while ((ch = getopt(argc, argv, "f:g:p:t:P:c:inh")) != -1)
     {
@@ -1386,6 +1416,22 @@ static int load_config(const char *config_file, struct optentry *opt)
     opt->heartbeat_check_interval = config_get_int(config, "heartbeat_check_interval", opt->heartbeat_check_interval);
     opt->max_reconnect_attempts = config_get_int(config, "max_reconnect_attempts", opt->max_reconnect_attempts);
     opt->reconnect_delay_ms = config_get_int(config, "reconnect_delay_ms", opt->reconnect_delay_ms);
+
+    /* 资源监控配置 */
+    opt->enable_resource_monitor = config_get_int(config, "enable_resource_monitor", opt->enable_resource_monitor);
+    opt->resource_sample_interval_ms = config_get_int(config, "resource_sample_interval_ms", opt->resource_sample_interval_ms);
+    opt->resource_cpu_critical = (float)config_get_int(config, "resource_cpu_critical", (int)opt->resource_cpu_critical);
+    opt->resource_cpu_low = (float)config_get_int(config, "resource_cpu_low", (int)opt->resource_cpu_low);
+    opt->resource_mem_critical = (float)config_get_int(config, "resource_mem_critical", (int)opt->resource_mem_critical);
+    opt->resource_mem_low = (float)config_get_int(config, "resource_mem_low", (int)opt->resource_mem_low);
+
+    /* 看门狗配置 */
+    opt->enable_watchdog = config_get_int(config, "enable_watchdog", opt->enable_watchdog);
+    str_val = config_get_string(config, "watchdog_device", NULL);
+    if (str_val != NULL)
+        opt->watchdog_device = strdup(str_val);
+    opt->watchdog_timeout_sec = config_get_int(config, "watchdog_timeout_sec", opt->watchdog_timeout_sec);
+    opt->watchdog_feed_interval_ms = config_get_int(config, "watchdog_feed_interval_ms", opt->watchdog_feed_interval_ms);
 
     config_free(config);
     return 0;
@@ -1536,6 +1582,61 @@ int main(int argc, char *argv[])
 
     LOG_INFO(MODULE_NAME, "heartbeat enabled: timeout=%ds check_interval=%dms max_reconnect=%d",
              opt.heartbeat_timeout, opt.heartbeat_check_interval, opt.max_reconnect_attempts);
+
+    /* Initialize resource monitor */
+    if (opt.enable_resource_monitor)
+    {
+        resource_monitor_config_t res_config;
+        res_config.sample_interval_ms = opt.resource_sample_interval_ms;
+        res_config.cpu_critical_threshold = opt.resource_cpu_critical;
+        res_config.cpu_low_threshold = opt.resource_cpu_low;
+        res_config.mem_critical_threshold = opt.resource_mem_critical;
+        res_config.mem_low_threshold = opt.resource_mem_low;
+        res_config.enable_adaptive = 1;
+
+        g_resource_monitor = resource_monitor_create(&res_config);
+        if (g_resource_monitor == NULL)
+        {
+            LOG_ERROR(MODULE_NAME, "resource_monitor_create failed");
+            goto out;
+        }
+        LOG_INFO(MODULE_NAME, "resource monitor enabled: sample_interval=%dms cpu_critical=%.1f%% mem_critical=%.1f%%",
+                 opt.resource_sample_interval_ms, opt.resource_cpu_critical, opt.resource_mem_critical);
+    }
+
+    /* Initialize watchdog */
+    if (opt.enable_watchdog)
+    {
+        watchdog_config_t wd_config;
+        wd_config.type = WATCHDOG_TYPE_HARDWARE;
+        wd_config.device_path = opt.watchdog_device;
+        wd_config.timeout_sec = opt.watchdog_timeout_sec;
+        wd_config.feed_interval_ms = opt.watchdog_feed_interval_ms;
+        wd_config.enable_magic_close = 1;
+
+        g_watchdog = watchdog_create(&wd_config);
+        if (g_watchdog == NULL)
+        {
+            LOG_WARN(MODULE_NAME, "watchdog_create failed, continuing without watchdog");
+            opt.enable_watchdog = 0;
+        }
+        else
+        {
+            if (watchdog_start(g_watchdog) < 0)
+            {
+                LOG_WARN(MODULE_NAME, "watchdog_start failed, continuing without watchdog");
+                watchdog_destroy(g_watchdog);
+                g_watchdog = NULL;
+                opt.enable_watchdog = 0;
+            }
+            else
+            {
+                LOG_INFO(MODULE_NAME, "watchdog enabled: device=%s timeout=%ds feed_interval=%dms",
+                         opt.watchdog_device, opt.watchdog_timeout_sec, opt.watchdog_feed_interval_ms);
+            }
+        }
+    }
+
     LOG_INFO(MODULE_NAME, "entering main event loop");
 
     while (!g_stop)
@@ -1595,6 +1696,60 @@ int main(int argc, char *argv[])
                 else
                 {
                     usleep(opt.reconnect_delay_ms * 1000);
+                }
+            }
+        }
+
+        /* Update resource monitor and apply adaptive policy */
+        if (opt.enable_resource_monitor && g_resource_monitor)
+        {
+            static time_t last_resource_check = 0;
+            time_t now = time(NULL);
+
+            if (now - last_resource_check >= opt.resource_sample_interval_ms / 1000)
+            {
+                resource_stats_t stats;
+                resource_level_t level;
+                adaptive_policy_t policy;
+
+                if (resource_monitor_update(g_resource_monitor) == 0 &&
+                    resource_monitor_get_stats(g_resource_monitor, &stats) == 0)
+                {
+                    level = resource_monitor_get_level(g_resource_monitor);
+
+                    if (level == RESOURCE_LEVEL_CRITICAL || level == RESOURCE_LEVEL_LOW)
+                    {
+                        LOG_WARN(MODULE_NAME, "resource level: %s (cpu=%.1f%% mem=%.1f%%)",
+                                 resource_level_to_string(level),
+                                 stats.cpu_usage_percent,
+                                 stats.mem_usage_percent);
+
+                        /* Apply adaptive policy */
+                        if (resource_monitor_get_policy(g_resource_monitor, &policy) == 0)
+                        {
+                            /* TODO: Apply policy adjustments to jitter buffer and bitrate */
+                            LOG_INFO(MODULE_NAME, "adaptive policy: buffer=%d bitrate=%dkbps",
+                                     policy.jitter_buffer_size, policy.max_bitrate_kbps);
+                        }
+                    }
+                }
+
+                last_resource_check = now;
+            }
+        }
+
+        /* Feed watchdog */
+        if (opt.enable_watchdog && g_watchdog)
+        {
+            if (watchdog_should_feed(g_watchdog))
+            {
+                if (watchdog_feed(g_watchdog) < 0)
+                {
+                    LOG_ERROR(MODULE_NAME, "watchdog_feed failed");
+                }
+                else
+                {
+                    LOG_DEBUG(MODULE_NAME, "watchdog fed");
                 }
             }
         }
@@ -1746,6 +1901,20 @@ out:
 
     free(recv_buf);
     free(g_outbuf.buf);
+
+    /* Cleanup resource monitor and watchdog */
+    if (g_resource_monitor)
+    {
+        resource_monitor_destroy(g_resource_monitor);
+        g_resource_monitor = NULL;
+    }
+
+    if (g_watchdog)
+    {
+        watchdog_stop(g_watchdog);
+        watchdog_destroy(g_watchdog);
+        g_watchdog = NULL;
+    }
 
     logger_destroy();
     return exit_code;

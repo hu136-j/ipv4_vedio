@@ -1,7 +1,8 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -I../meduim -pthread
 COMMON_DIR = ../common
-COMMON_OBJS = $(COMMON_DIR)/config.o $(COMMON_DIR)/logger.o $(COMMON_DIR)/heartbeat.o
+COMMON_OBJS = $(COMMON_DIR)/config.o $(COMMON_DIR)/logger.o $(COMMON_DIR)/heartbeat.o \
+              $(COMMON_DIR)/resource_monitor.o $(COMMON_DIR)/watchdog.o
 TARGET = clinet
 SRC = client.c
 
