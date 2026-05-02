@@ -19,11 +19,6 @@
 #include <sys/epoll.h>
 
 #include "proto.h"
-#include "config.h"
-#include "logger.h"
-#include "heartbeat.h"
-
-#define MODULE_NAME "client"
 
 #define RECV_BUF_SIZE        (NET_AUDIO_HDR_LEN + AUDIO_CHUNK_SIZE + 64)
 #define JITTER_BUFFER_SIZE   64
@@ -81,19 +76,10 @@ struct optentry
     uint16_t udp_port;
     uint16_t control_port;
     char group[INET_ADDRSTRLEN];
-    char control_listen_ip[INET_ADDRSTRLEN];
     const char *player_path;
     int auto_channel;
     int interactive_mode;
     int enable_control;
-    int jitter_buffer_size;
-    int start_buffer_packets;
-    int skip_threshold;
-    size_t outbuf_capacity;
-    int heartbeat_timeout;
-    int heartbeat_check_interval;
-    int max_reconnect_attempts;
-    int reconnect_delay_ms;
 };
 
 struct fd_ctx
@@ -128,7 +114,6 @@ struct program_entry
 
 static struct jitter_buffer g_jitter_buf;
 static struct outbuf g_outbuf;
-static struct heartbeat_state g_heartbeat;
 static struct player_state g_player = {
     .pid = INVALID_PID,
     .pipe_wfd = INVALID_FD,
@@ -171,8 +156,7 @@ static void install_signal_handlers(void)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-f config_file] [-g multicast_ip] [-p udp_port] [-t tcp_port] [-P player] [-c channel] [-i] [-n]\n"
-            "  -f config file path, default ./client.conf\n"
+            "Usage: %s [-g multicast_ip] [-p udp_port] [-t tcp_port] [-P player] [-c channel] [-i] [-n]\n"
             "  -g multicast group, default %s\n"
             "  -p UDP port, default %s\n"
             "  -t TCP control port, default %d\n"
@@ -513,9 +497,6 @@ static int parse_audio_packet_and_queue(const char *buf, int len, uint8_t choose
     if (jitter_store_packet(seq, buf + NET_AUDIO_HDR_LEN, payload_len) < 0)
         return -1;
 
-    /* Update heartbeat on valid audio packet */
-    heartbeat_update(&g_heartbeat);
-
     return jitter_drain_to_outbuf();
 }
 
@@ -744,56 +725,6 @@ static void player_stop(void)
     g_player.pid = INVALID_PID;
 }
 
-static int player_check_alive(void)
-{
-    int status;
-
-    if (g_player.pid <= 0)
-        return 0;
-
-    /* Check if player process is still alive */
-    pid_t ret = waitpid(g_player.pid, &status, WNOHANG);
-    if (ret == g_player.pid)
-    {
-        /* Player has exited */
-        LOG_WARN(MODULE_NAME, "player process exited unexpectedly, pid=%d", g_player.pid);
-        return 0;
-    }
-
-    return 1;
-}
-
-static int rejoin_multicast(int sfd, const struct optentry *opt)
-{
-    struct ip_mreqn mreq;
-
-    LOG_INFO(MODULE_NAME, "attempting to rejoin multicast group %s", opt->group);
-
-    /* Leave the multicast group first */
-    memset(&mreq, 0, sizeof(mreq));
-    if (inet_pton(AF_INET, opt->group, &mreq.imr_multiaddr.s_addr) <= 0)
-    {
-        LOG_ERROR(MODULE_NAME, "inet_pton group ip error: %s", opt->group);
-        return -1;
-    }
-
-    mreq.imr_address.s_addr = htonl(INADDR_ANY);
-    mreq.imr_ifindex = 0;
-
-    /* Try to leave (ignore errors as we might not be in the group) */
-    setsockopt(sfd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
-
-    /* Rejoin the multicast group */
-    if (setsockopt(sfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0)
-    {
-        LOG_ERROR(MODULE_NAME, "setsockopt IP_ADD_MEMBERSHIP failed: %s", strerror(errno));
-        return -1;
-    }
-
-    LOG_INFO(MODULE_NAME, "successfully rejoined multicast group");
-    return 0;
-}
-
 static int player_start(const char *player_path)
 {
     int pipefd[2];
@@ -881,12 +812,10 @@ static int start_playback(int channel, const struct optentry *opt)
     if (player_start(opt->player_path) < 0)
     {
         g_current_channel = 0;
-        LOG_ERROR(MODULE_NAME, "failed to start player for channel %d", channel);
         return -1;
     }
 
     g_current_channel = channel;
-    LOG_INFO(MODULE_NAME, "playing channel %d", channel);
     printf("play channel %d\n", channel);
     fflush(stdout);
     return 0;
@@ -896,7 +825,6 @@ static void stop_playback(void)
 {
     if (g_current_channel != 0)
     {
-        LOG_INFO(MODULE_NAME, "stopping playback of channel %d", g_current_channel);
         printf("stop playback\n");
         fflush(stdout);
     }
@@ -1113,7 +1041,7 @@ static int process_controller_input(const struct optentry *opt)
     return 0;
 }
 
-static int create_control_listener(const struct optentry *opt)
+static int create_control_listener(uint16_t port)
 {
     struct sockaddr_in addr;
     int fd;
@@ -1122,44 +1050,44 @@ static int create_control_listener(const struct optentry *opt)
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
     {
-        LOG_ERROR(MODULE_NAME, "socket tcp failed: %s", strerror(errno));
+        perror("socket tcp");
         return -1;
     }
 
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0)
     {
-        LOG_ERROR(MODULE_NAME, "setsockopt SO_REUSEADDR tcp failed: %s", strerror(errno));
+        perror("setsockopt SO_REUSEADDR tcp");
         close(fd);
         return -1;
     }
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(opt->control_port);
-    if (inet_pton(AF_INET, opt->control_listen_ip, &addr.sin_addr) <= 0)
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, CONTROL_LISTEN_IP, &addr.sin_addr) <= 0)
     {
-        LOG_ERROR(MODULE_NAME, "invalid control listen ip: %s", opt->control_listen_ip);
+        fprintf(stderr, "invalid control listen ip\n");
         close(fd);
         return -1;
     }
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
-        LOG_ERROR(MODULE_NAME, "bind tcp failed: %s", strerror(errno));
+        perror("bind tcp");
         close(fd);
         return -1;
     }
 
     if (listen(fd, CONTROL_LISTEN_BACKLOG) < 0)
     {
-        LOG_ERROR(MODULE_NAME, "listen tcp failed: %s", strerror(errno));
+        perror("listen tcp");
         close(fd);
         return -1;
     }
 
     if (set_nonblock(fd) < 0)
     {
-        LOG_ERROR(MODULE_NAME, "set_nonblock control listener failed: %s", strerror(errno));
+        perror("set_nonblock control listener");
         close(fd);
         return -1;
     }
@@ -1260,39 +1188,24 @@ static int wait_for_first_list_and_choose(int sfd, char *recv_buf)
     return -1;
 }
 
-static int parse_args(int argc, char *argv[], struct optentry *opt, const char **config_file)
+static int parse_args(int argc, char *argv[], struct optentry *opt)
 {
     int ch;
-
-    *config_file = "./client.conf";
 
     memset(opt, 0, sizeof(*opt));
     opt->udp_port = (uint16_t)atoi(PORT);
     opt->control_port = DEFAULT_CONTROL_PORT;
     strncpy(opt->group, MYGRUOP, sizeof(opt->group) - 1);
     opt->group[sizeof(opt->group) - 1] = '\0';
-    strncpy(opt->control_listen_ip, CONTROL_LISTEN_IP, sizeof(opt->control_listen_ip) - 1);
-    opt->control_listen_ip[sizeof(opt->control_listen_ip) - 1] = '\0';
     opt->player_path = "mpg123";
     opt->auto_channel = 0;
     opt->interactive_mode = 0;
     opt->enable_control = 1;
-    opt->jitter_buffer_size = JITTER_BUFFER_SIZE;
-    opt->start_buffer_packets = START_BUFFER_PACKETS;
-    opt->skip_threshold = SKIP_THRESHOLD;
-    opt->outbuf_capacity = OUTBUF_CAPACITY;
-    opt->heartbeat_timeout = 10;
-    opt->heartbeat_check_interval = 500;
-    opt->max_reconnect_attempts = 0;
-    opt->reconnect_delay_ms = 2000;
 
-    while ((ch = getopt(argc, argv, "f:g:p:t:P:c:inh")) != -1)
+    while ((ch = getopt(argc, argv, "g:p:t:P:c:inh")) != -1)
     {
         switch (ch)
         {
-            case 'f':
-                *config_file = optarg;
-                break;
             case 'g':
                 strncpy(opt->group, optarg, sizeof(opt->group) - 1);
                 opt->group[sizeof(opt->group) - 1] = '\0';
@@ -1338,67 +1251,9 @@ static int parse_args(int argc, char *argv[], struct optentry *opt, const char *
     return 0;
 }
 
-static int load_config(const char *config_file, struct optentry *opt)
-{
-    config_t *config;
-    const char *str_val;
-
-    config = config_load(config_file);
-    if (config == NULL)
-    {
-        LOG_WARN(MODULE_NAME, "failed to load config file %s, using defaults", config_file);
-        return 0;
-    }
-
-    LOG_INFO(MODULE_NAME, "loaded config from %s", config_file);
-
-    str_val = config_get_string(config, "multicast_group", NULL);
-    if (str_val != NULL)
-    {
-        strncpy(opt->group, str_val, sizeof(opt->group) - 1);
-        opt->group[sizeof(opt->group) - 1] = '\0';
-    }
-
-    opt->udp_port = config_get_uint16(config, "multicast_port", opt->udp_port);
-    opt->control_port = config_get_uint16(config, "control_port", opt->control_port);
-
-    str_val = config_get_string(config, "control_listen_ip", NULL);
-    if (str_val != NULL)
-    {
-        strncpy(opt->control_listen_ip, str_val, sizeof(opt->control_listen_ip) - 1);
-        opt->control_listen_ip[sizeof(opt->control_listen_ip) - 1] = '\0';
-    }
-
-    str_val = config_get_string(config, "player_path", NULL);
-    if (str_val != NULL)
-        opt->player_path = strdup(str_val);
-
-    opt->auto_channel = config_get_int(config, "auto_channel", opt->auto_channel);
-    opt->interactive_mode = config_get_int(config, "interactive_mode", opt->interactive_mode);
-    opt->enable_control = config_get_int(config, "enable_control", opt->enable_control);
-
-    opt->jitter_buffer_size = config_get_int(config, "jitter_buffer_size", opt->jitter_buffer_size);
-    opt->start_buffer_packets = config_get_int(config, "start_buffer_packets", opt->start_buffer_packets);
-    opt->skip_threshold = config_get_int(config, "skip_threshold", opt->skip_threshold);
-    opt->outbuf_capacity = (size_t)config_get_int(config, "outbuf_capacity", (int)opt->outbuf_capacity);
-
-    opt->heartbeat_timeout = config_get_int(config, "heartbeat_timeout", opt->heartbeat_timeout);
-    opt->heartbeat_check_interval = config_get_int(config, "heartbeat_check_interval", opt->heartbeat_check_interval);
-    opt->max_reconnect_attempts = config_get_int(config, "max_reconnect_attempts", opt->max_reconnect_attempts);
-    opt->reconnect_delay_ms = config_get_int(config, "reconnect_delay_ms", opt->reconnect_delay_ms);
-
-    config_free(config);
-    return 0;
-}
-
 int main(int argc, char *argv[])
 {
     struct optentry opt;
-    const char *config_file;
-    config_t *log_config;
-    struct logger_config logger_cfg;
-    const char *log_level_str;
-    const char *log_file_str;
     int sfd = INVALID_FD;
     int exit_code = 1;
     int fatal_error = 0;
@@ -1406,61 +1261,12 @@ int main(int argc, char *argv[])
     struct epoll_event events[MAX_EVENTS];
     struct fd_ctx sock_ctx;
 
-    if (parse_args(argc, argv, &opt, &config_file) < 0)
+    if (parse_args(argc, argv, &opt) < 0)
         return 1;
 
-    log_config = config_load(config_file);
-    memset(&logger_cfg, 0, sizeof(logger_cfg));
-    logger_cfg.min_level = LOG_LEVEL_INFO;
-    logger_cfg.output = stdout;
-    logger_cfg.use_color = 1;
-    logger_cfg.show_timestamp = 1;
-    logger_cfg.show_thread_id = 0;
-
-    if (log_config != NULL)
-    {
-        log_level_str = config_get_string(log_config, "log_level", "INFO");
-        if (strcasecmp(log_level_str, "DEBUG") == 0)
-            logger_cfg.min_level = LOG_LEVEL_DEBUG;
-        else if (strcasecmp(log_level_str, "INFO") == 0)
-            logger_cfg.min_level = LOG_LEVEL_INFO;
-        else if (strcasecmp(log_level_str, "WARN") == 0)
-            logger_cfg.min_level = LOG_LEVEL_WARN;
-        else if (strcasecmp(log_level_str, "ERROR") == 0)
-            logger_cfg.min_level = LOG_LEVEL_ERROR;
-
-        log_file_str = config_get_string(log_config, "log_file", "");
-        if (log_file_str != NULL && log_file_str[0] != '\0')
-        {
-            logger_cfg.output = fopen(log_file_str, "a");
-            if (logger_cfg.output == NULL)
-            {
-                fprintf(stderr, "failed to open log file %s, using stdout\n", log_file_str);
-                logger_cfg.output = stdout;
-            }
-        }
-
-        logger_cfg.use_color = config_get_int(log_config, "log_use_color", 1);
-        logger_cfg.show_timestamp = config_get_int(log_config, "log_show_timestamp", 1);
-        logger_cfg.show_thread_id = config_get_int(log_config, "log_show_thread_id", 0);
-    }
-
-    logger_init(&logger_cfg);
-    LOG_INFO(MODULE_NAME, "client starting");
-
-    if (log_config != NULL)
-    {
-        load_config(config_file, &opt);
-        config_free(log_config);
-    }
-
     install_signal_handlers();
-    outbuf_init(&g_outbuf, opt.outbuf_capacity);
+    outbuf_init(&g_outbuf, OUTBUF_CAPACITY);
     jitter_reset();
-
-    LOG_INFO(MODULE_NAME, "multicast group=%s port=%u", opt.group, opt.udp_port);
-    LOG_INFO(MODULE_NAME, "control server=%s:%u enabled=%d",
-             opt.control_listen_ip, opt.control_port, opt.enable_control);
 
     sfd = create_udp_receiver(&opt);
     if (sfd < 0)
@@ -1469,7 +1275,7 @@ int main(int argc, char *argv[])
     recv_buf = malloc(RECV_BUF_SIZE);
     if (recv_buf == NULL)
     {
-        LOG_ERROR(MODULE_NAME, "malloc recv_buf error");
+        fprintf(stderr, "malloc recv_buf error\n");
         goto out;
     }
 
@@ -1482,14 +1288,14 @@ int main(int argc, char *argv[])
 
     if (set_nonblock(sfd) < 0)
     {
-        LOG_ERROR(MODULE_NAME, "set_nonblock udp failed: %s", strerror(errno));
+        perror("set_nonblock udp");
         goto out;
     }
 
     g_epfd = epoll_create1(0);
     if (g_epfd < 0)
     {
-        LOG_ERROR(MODULE_NAME, "epoll_create1 failed: %s", strerror(errno));
+        perror("epoll_create1");
         goto out;
     }
 
@@ -1503,7 +1309,7 @@ int main(int argc, char *argv[])
 
     if (opt.enable_control)
     {
-        g_controller.listen_fd = create_control_listener(&opt);
+        g_controller.listen_fd = create_control_listener(opt.control_port);
         if (g_controller.listen_fd < 0)
             goto out;
 
@@ -1517,33 +1323,19 @@ int main(int argc, char *argv[])
         }
 
         printf("control server listening on %s:%u\n",
-               opt.control_listen_ip, opt.control_port);
+               CONTROL_LISTEN_IP, opt.control_port);
         fflush(stdout);
     }
 
     if (opt.auto_channel != 0 && start_playback(opt.auto_channel, &opt) < 0)
         goto out;
 
-    /* Initialize heartbeat */
-    {
-        struct heartbeat_config hb_config;
-        hb_config.timeout_seconds = opt.heartbeat_timeout;
-        hb_config.check_interval_ms = opt.heartbeat_check_interval;
-        hb_config.max_reconnect_attempts = opt.max_reconnect_attempts;
-        hb_config.reconnect_delay_ms = opt.reconnect_delay_ms;
-        heartbeat_init(&g_heartbeat, &hb_config);
-    }
-
-    LOG_INFO(MODULE_NAME, "heartbeat enabled: timeout=%ds check_interval=%dms max_reconnect=%d",
-             opt.heartbeat_timeout, opt.heartbeat_check_interval, opt.max_reconnect_attempts);
-    LOG_INFO(MODULE_NAME, "entering main event loop");
-
     while (!g_stop)
     {
         int nfds;
         int i;
 
-        nfds = epoll_wait(g_epfd, events, MAX_EVENTS, opt.heartbeat_check_interval);
+        nfds = epoll_wait(g_epfd, events, MAX_EVENTS, EPOLL_WAIT_TIMEOUT_MS);
         if (nfds < 0)
         {
             if (errno == EINTR)
@@ -1551,52 +1343,6 @@ int main(int argc, char *argv[])
             perror("epoll_wait");
             fatal_error = 1;
             break;
-        }
-
-        /* Check heartbeat timeout and player health */
-        if (g_current_channel != 0)
-        {
-            /* Check if player is still alive */
-            if (player_active() && !player_check_alive())
-            {
-                LOG_WARN(MODULE_NAME, "player died, attempting restart for channel %d", g_current_channel);
-                player_stop();
-
-                if (player_start(opt.player_path) < 0)
-                {
-                    LOG_ERROR(MODULE_NAME, "failed to restart player");
-                    g_current_channel = 0;
-                }
-                else
-                {
-                    LOG_INFO(MODULE_NAME, "player restarted successfully");
-                    playback_buffers_reset();
-                }
-            }
-
-            /* Check heartbeat timeout */
-            if (heartbeat_check_timeout(&g_heartbeat))
-            {
-                int idle_time = heartbeat_get_idle_time(&g_heartbeat);
-                LOG_WARN(MODULE_NAME, "no data received for %d seconds, attempting reconnect", idle_time);
-
-                if (heartbeat_increment_reconnect(&g_heartbeat) < 0)
-                {
-                    LOG_ERROR(MODULE_NAME, "max reconnect attempts reached, giving up");
-                    fatal_error = 1;
-                    g_stop = 1;
-                    break;
-                }
-
-                if (rejoin_multicast(sfd, &opt) < 0)
-                {
-                    LOG_ERROR(MODULE_NAME, "failed to rejoin multicast group");
-                }
-                else
-                {
-                    usleep(opt.reconnect_delay_ms * 1000);
-                }
-            }
         }
 
         if (nfds == 0)
@@ -1727,8 +1473,6 @@ int main(int argc, char *argv[])
     exit_code = fatal_error ? 1 : 0;
 
 out:
-    LOG_INFO(MODULE_NAME, "shutting down, exit_code=%d", exit_code);
-
     close_controller_conn();
 
     if (g_controller.listen_fd >= 0)
@@ -1746,7 +1490,5 @@ out:
 
     free(recv_buf);
     free(g_outbuf.buf);
-
-    logger_destroy();
     return exit_code;
 }

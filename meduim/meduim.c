@@ -1,5 +1,6 @@
 #include <glob.h>
 #include <stdio.h>
+#include <errno.h>
 #include "proto.h"
 #include "token.h"
 #include <string.h>
@@ -11,7 +12,10 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <signal.h>
-#include"meduim.h"
+#include "meduim.h"
+#include "logger.h"
+
+#define MODULE_NAME "meduim"
 
 #define FILETYPE_UNKNOWN              (-1)
 #define FILETYPE_UNSUPPORTED          (-2)
@@ -115,7 +119,7 @@ static int8_t get_chanalentry(const char* dir_path, uint8_t pos)
     ret = glob(pattern, 0, NULL, &glob_res);
     if (ret != 0)
     {
-        perror("get_chanalentry glob()");
+        LOG_ERROR(MODULE_NAME, "get_chanalentry glob() failed: %s", strerror(errno));
         exit(1);
     }
 
@@ -163,7 +167,7 @@ static struct listentry_st* get_listentry(const char* dir_path, uint8_t pos)
     ret = glob(pattern, 0, NULL, &glob_res);
     if (ret != 0)
     {
-        perror("get_listentry glob()");
+        LOG_ERROR(MODULE_NAME, "get_listentry glob() failed: %s", strerror(errno));
         exit(1);
     }
 
@@ -182,7 +186,7 @@ static struct listentry_st* get_listentry(const char* dir_path, uint8_t pos)
             ptr = malloc(sizeof(uint8_t) * MAX_LIST_ST);
             if (ptr == NULL)
             {
-                fprintf(stderr, "listentry malloc error\n");
+                LOG_ERROR(MODULE_NAME, "listentry malloc error");
                 globfree(&glob_res);
                 exit(1);
             }
@@ -218,7 +222,7 @@ void get_list(const char* dir_path)
     ret = glob(pattern, GLOB_ONLYDIR, NULL, &glob_res);
     if (ret != 0)
     {
-        perror("get_list glob()");
+        LOG_ERROR(MODULE_NAME, "get_list glob() failed: %s", strerror(errno));
         exit(1);
     }
 
@@ -247,7 +251,7 @@ int8_t chanale_init(const char* dir_path)
     ret = glob(pattern, GLOB_ONLYDIR, NULL, &glob_res);
     if (ret != 0)
     {
-        perror("chanale_init glob()");
+        LOG_ERROR(MODULE_NAME, "chanale_init glob() failed: %s", strerror(errno));
         exit(1);
     }
 
@@ -256,7 +260,7 @@ int8_t chanale_init(const char* dir_path)
         ret = get_chanalentry(glob_res.gl_pathv[i], i);
         if (ret < 0)
         {
-            fprintf(stdout, "%s error\n", glob_res.gl_pathv[i]);
+            LOG_ERROR(MODULE_NAME, "get_chanalentry failed for %s", glob_res.gl_pathv[i]);
             globfree(&glob_res);
             return FILETYPE_UNKNOWN;
         }
@@ -350,15 +354,15 @@ void* send_chanal(void* ptr)
 
         if (ret < 0)
         {
-            perror("send_desc_packet()");
+            LOG_ERROR(MODULE_NAME, "send_desc_packet() failed: %s", strerror(errno));
             usleep(SEND_RETRY_INTERVAL_US);
         }
 
         fd = open(opt->game, O_RDONLY);
         if (fd < 0)
         {
-            fprintf(stderr, "open mp3 failed, chanal_id=%d path=%s\n",
-                opt->chanal_id, opt->game);
+            LOG_ERROR(MODULE_NAME, "open mp3 failed, chanal_id=%d path=%s: %s",
+                opt->chanal_id, opt->game, strerror(errno));
             usleep(OPEN_RETRY_INTERVAL_US);
             continue;
         }
@@ -370,7 +374,7 @@ void* send_chanal(void* ptr)
             read_len = read(fd, audio_buf, AUDIO_CHUNK_SIZE);
             if (read_len < 0)
             {
-                perror("read mp3");
+                LOG_ERROR(MODULE_NAME, "read mp3 failed: %s", strerror(errno));
                 break;
             }
             if (read_len == 0)
@@ -383,7 +387,7 @@ void* send_chanal(void* ptr)
                 ret = get_token(tbf_arr[ch_id], (uint32_t)read_len);
                 if (ret < 0)
                 {
-                    fprintf(stderr, "get_token error, chanal_id=%d\n", opt->chanal_id);
+                    LOG_ERROR(MODULE_NAME, "get_token error, chanal_id=%d", opt->chanal_id);
                     usleep(SEND_RETRY_INTERVAL_US);
                     continue;
                 }
@@ -396,7 +400,7 @@ void* send_chanal(void* ptr)
 
             if (ret < 0)
             {
-                perror("send_audio_packet()");
+                LOG_ERROR(MODULE_NAME, "send_audio_packet() failed: %s", strerror(errno));
                 usleep(SEND_RETRY_INTERVAL_US);
                 continue;
             }
