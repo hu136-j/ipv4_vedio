@@ -30,11 +30,21 @@
 #define CONTROL_LINE_MAX     1024
 #define PROGRAM_NAME_MAX     512
 #define CONTROL_LISTEN_IP    "127.0.0.1"
+#define DEFAULT_CONTROL_PORT 9000
+#define CONTROL_LISTEN_BACKLOG 4
+#define EPOLL_WAIT_TIMEOUT_MS 500
+#define PLAYER_STARTUP_WAIT_US 100000
+#define CHILD_EXIT_POLL_RETRIES 10
+#define CHILD_EXIT_POLL_INTERVAL_US 20000
+#define CONTROL_RECV_CHUNK_SIZE 256
 
 #define FD_TAG_SOCK          1
 #define FD_TAG_PIPE          2
 #define FD_TAG_CTRL_LISTEN   3
 #define FD_TAG_CTRL_CONN     4
+
+#define INVALID_FD           (-1)
+#define INVALID_PID          (-1)
 
 struct audio_frame
 {
@@ -104,17 +114,21 @@ struct program_entry
 
 static struct jitter_buffer g_jitter_buf;
 static struct outbuf g_outbuf;
-static struct player_state g_player = { .pid = -1, .pipe_wfd = -1, .pipe_ctx = { FD_TAG_PIPE, -1 } };
+static struct player_state g_player = {
+    .pid = INVALID_PID,
+    .pipe_wfd = INVALID_FD,
+    .pipe_ctx = { FD_TAG_PIPE, INVALID_FD }
+};
 static struct controller_state g_controller = {
-    .listen_fd = -1,
-    .conn_fd = -1,
+    .listen_fd = INVALID_FD,
+    .conn_fd = INVALID_FD,
     .recv_len = 0,
-    .listen_ctx = { FD_TAG_CTRL_LISTEN, -1 },
-    .conn_ctx = { FD_TAG_CTRL_CONN, -1 }
+    .listen_ctx = { FD_TAG_CTRL_LISTEN, INVALID_FD },
+    .conn_ctx = { FD_TAG_CTRL_CONN, INVALID_FD }
 };
 static struct program_entry g_programs[CHANAL_NUM];
 static int g_program_count = 0;
-static int g_epfd = -1;
+static int g_epfd = INVALID_FD;
 static int g_current_channel = 0;
 static int g_desc_printed = 0;
 static int g_list_announced = 0;
@@ -145,12 +159,12 @@ static void usage(const char *prog)
             "Usage: %s [-g multicast_ip] [-p udp_port] [-t tcp_port] [-P player] [-c channel] [-i] [-n]\n"
             "  -g multicast group, default %s\n"
             "  -p UDP port, default %s\n"
-            "  -t TCP control port, default 9000\n"
+            "  -t TCP control port, default %d\n"
             "  -P player program, default mpg123\n"
             "  -c start playing a channel immediately\n"
             "  -i interactive channel selection after first list packet\n"
             "  -n disable TCP control server\n",
-            prog, MYGRUOP, PORT);
+            prog, MYGRUOP, PORT, DEFAULT_CONTROL_PORT);
 }
 
 static int set_nonblock(int fd)
@@ -661,8 +675,8 @@ static void close_controller_conn(void)
         close(g_controller.conn_fd);
     }
 
-    g_controller.conn_fd = -1;
-    g_controller.conn_ctx.fd = -1;
+    g_controller.conn_fd = INVALID_FD;
+    g_controller.conn_ctx.fd = INVALID_FD;
     g_controller.recv_len = 0;
 }
 
@@ -671,14 +685,14 @@ static int wait_child_exit(pid_t pid)
     int i;
     int status;
 
-    for (i = 0; i < 10; i++)
+    for (i = 0; i < CHILD_EXIT_POLL_RETRIES; i++)
     {
         pid_t ret = waitpid(pid, &status, WNOHANG);
         if (ret == pid)
             return 0;
         if (ret < 0 && errno != EINTR)
             return -1;
-        usleep(20000);
+        usleep(CHILD_EXIT_POLL_INTERVAL_US);
     }
 
     kill(pid, SIGTERM);
@@ -702,13 +716,13 @@ static void player_stop(void)
     if (g_player.pipe_wfd >= 0)
         close(g_player.pipe_wfd);
 
-    g_player.pipe_wfd = -1;
-    g_player.pipe_ctx.fd = -1;
+    g_player.pipe_wfd = INVALID_FD;
+    g_player.pipe_ctx.fd = INVALID_FD;
 
     if (pid > 0)
         wait_child_exit(pid);
 
-    g_player.pid = -1;
+    g_player.pid = INVALID_PID;
 }
 
 static int player_start(const char *player_path)
@@ -769,7 +783,7 @@ static int player_start(const char *player_path)
         return -1;
     }
 
-    usleep(100000);
+    usleep(PLAYER_STARTUP_WAIT_US);
     if (waitpid(pid, &status, WNOHANG) == pid)
     {
         fprintf(stderr, "player exited immediately\n");
@@ -962,7 +976,7 @@ static int accept_controller_connection(void)
 
 static int process_controller_input(const struct optentry *opt)
 {
-    char buf[256];
+    char buf[CONTROL_RECV_CHUNK_SIZE];
 
     while (g_controller.conn_fd >= 0)
     {
@@ -1064,7 +1078,7 @@ static int create_control_listener(uint16_t port)
         return -1;
     }
 
-    if (listen(fd, 4) < 0)
+    if (listen(fd, CONTROL_LISTEN_BACKLOG) < 0)
     {
         perror("listen tcp");
         close(fd);
@@ -1180,7 +1194,7 @@ static int parse_args(int argc, char *argv[], struct optentry *opt)
 
     memset(opt, 0, sizeof(*opt));
     opt->udp_port = (uint16_t)atoi(PORT);
-    opt->control_port = 9000;
+    opt->control_port = DEFAULT_CONTROL_PORT;
     strncpy(opt->group, MYGRUOP, sizeof(opt->group) - 1);
     opt->group[sizeof(opt->group) - 1] = '\0';
     opt->player_path = "mpg123";
@@ -1240,7 +1254,7 @@ static int parse_args(int argc, char *argv[], struct optentry *opt)
 int main(int argc, char *argv[])
 {
     struct optentry opt;
-    int sfd = -1;
+    int sfd = INVALID_FD;
     int exit_code = 1;
     int fatal_error = 0;
     char *recv_buf = NULL;
@@ -1321,7 +1335,7 @@ int main(int argc, char *argv[])
         int nfds;
         int i;
 
-        nfds = epoll_wait(g_epfd, events, MAX_EVENTS, 500);
+        nfds = epoll_wait(g_epfd, events, MAX_EVENTS, EPOLL_WAIT_TIMEOUT_MS);
         if (nfds < 0)
         {
             if (errno == EINTR)

@@ -18,6 +18,14 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#define DEFAULT_CORE_IP             "127.0.0.1"
+#define DEFAULT_CORE_PORT           9000
+#define TCP_DISCONNECT_WAIT_MS      300
+#define WINDOW_DEFAULT_WIDTH        760
+#define WINDOW_DEFAULT_HEIGHT       560
+#define PORT_MIN_VALUE              1
+#define PORT_MAX_VALUE              65535
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent),
       socket_(new QTcpSocket(this)),
@@ -47,7 +55,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
         socket_->flush();
         socket_->disconnectFromHost();
         if (socket_->state() != QAbstractSocket::UnconnectedState)
-            socket_->waitForDisconnected(300);
+            socket_->waitForDisconnected(TCP_DISCONNECT_WAIT_MS);
     }
 
     QMainWindow::closeEvent(event);
@@ -157,7 +165,7 @@ void MainWindow::setupUi()
     QHBoxLayout *controlLayout = new QHBoxLayout(controlRow);
     QLabel *statusLabel = new QLabel("Status", centralWidget);
 
-    ipEdit_ = new QLineEdit("127.0.0.1", connectionGroup);
+    ipEdit_ = new QLineEdit(DEFAULT_CORE_IP, connectionGroup);
     portSpinBox_ = new QSpinBox(connectionGroup);
     connectButton_ = new QPushButton("Connect", buttonRow);
     disconnectButton_ = new QPushButton("Disconnect", buttonRow);
@@ -168,10 +176,10 @@ void MainWindow::setupUi()
     statusText_ = new QTextEdit(centralWidget);
 
     setWindowTitle("Streaming Broadcast Controller");
-    resize(760, 560);
+    resize(WINDOW_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT);
 
-    portSpinBox_->setRange(1, 65535);
-    portSpinBox_->setValue(9000);
+    portSpinBox_->setRange(PORT_MIN_VALUE, PORT_MAX_VALUE);
+    portSpinBox_->setValue(DEFAULT_CORE_PORT);
 
     buttonLayout->setContentsMargins(0, 0, 0, 0);
     buttonLayout->addWidget(connectButton_);

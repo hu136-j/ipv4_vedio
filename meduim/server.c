@@ -15,7 +15,13 @@
 #include "token.h"
 #include "meduim.h"
 
- volatile sig_atomic_t server_stop = 0;
+#define SERVER_DAEMON_ARG            "-d"
+#define MULTICAST_ALL_ENABLED        1
+#define TOKEN_BURST_BYTES            12288
+#define TOKEN_REFILL_BYTES_PER_TICK  1600
+#define LIST_BROADCAST_INTERVAL_SEC  5
+
+volatile sig_atomic_t server_stop = 0;
 
 static void sig_handler(int signo)
 {
@@ -120,7 +126,7 @@ int main(int argc, char *argv[])
 
     for (i = 1; i < argc; i++)
     {
-        if (strcmp(argv[i], "-d") == 0)
+        if (strcmp(argv[i], SERVER_DAEMON_ARG) == 0)
         {
             daemon_mode = 1;
             continue;
@@ -160,7 +166,7 @@ int main(int argc, char *argv[])
     }
 
     {
-        int val = 1;
+        int val = MULTICAST_ALL_ENABLED;
         ret = setsockopt(sfd, IPPROTO_IP, IP_MULTICAST_ALL, &val, sizeof(val));
         if (ret < 0)
         {
@@ -185,7 +191,7 @@ int main(int argc, char *argv[])
 
     for (i = 0; i < CHANAL_NUM && chanal_buff[i] != NULL; i++)
     {
-        tbf_arr[i] = token_init(12288, 1600);
+        tbf_arr[i] = token_init(TOKEN_BURST_BYTES, TOKEN_REFILL_BYTES_PER_TICK);
         if (tbf_arr[i] == NULL)
         {
             fprintf(stderr, "token_init failed for chanal %d\n", i + 1);
@@ -230,7 +236,7 @@ int main(int argc, char *argv[])
         if (ret < 0)
             perror("sendto list");
 
-        for (i = 0; i < 5 && !server_stop; i++)
+        for (i = 0; i < LIST_BROADCAST_INTERVAL_SEC && !server_stop; i++)
             sleep(1);
     }
 

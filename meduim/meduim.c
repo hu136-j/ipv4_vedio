@@ -12,6 +12,20 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include"meduim.h"
+
+#define FILETYPE_UNKNOWN              (-1)
+#define FILETYPE_UNSUPPORTED          (-2)
+#define FILETYPE_DESC                 1
+#define FILETYPE_AUDIO                2
+#define CHANNEL_ID_BASE               1
+#define GLOB_PATTERN_SIZE             256
+#define PATH_GLOB_SUFFIX              "/*"
+#define DESC_RESERVED_OFFSET          4
+#define DESC_RESERVED_VALUE           0
+#define LIST_ENTRY_FIXED_SIZE         ((int)(sizeof(uint8_t) + sizeof(uint16_t)))
+#define SEND_RETRY_INTERVAL_US        10000
+#define OPEN_RETRY_INTERVAL_US        100000
+
 struct chanal_st* chanal_buff[CHANAL_NUM] = { NULL };
 struct listentry_st* list_buff[CHANAL_NUM] = { NULL };
 struct token_entyr* tbf_arr[CHANAL_NUM] = { NULL };
@@ -35,7 +49,7 @@ static struct chanal_st* get_filentry(glob_t* dir_path, char* file_type)
 
     while (*file_type != 0)
     {
-        if (*file_type == 1)
+        if (*file_type == FILETYPE_DESC)
         {
             fd = open(dir_path->gl_pathv[(int)count1], O_RDONLY);
             if (fd < 0)
@@ -55,7 +69,7 @@ static struct chanal_st* get_filentry(glob_t* dir_path, char* file_type)
             ptr->desc_len = count;
             close(fd);
         }
-        else if (*file_type == 2)
+        else if (*file_type == FILETYPE_AUDIO)
         {
             strncpy(ptr->game, dir_path->gl_pathv[(int)count1], MAX_GAME - 1);
             ptr->game[MAX_GAME - 1] = '\0';
@@ -72,31 +86,31 @@ static struct chanal_st* get_filentry(glob_t* dir_path, char* file_type)
 static int8_t get_filetype(const char* dir_path)
 {
     if (dir_path == NULL)
-        return -1;
+        return FILETYPE_UNKNOWN;
 
     const char* opt = strrchr(dir_path, '.');
     if (opt == NULL)
-        return -1;
+        return FILETYPE_UNKNOWN;
 
     if (strcmp(opt + 1, "txt") == 0)
-        return 1;
+        return FILETYPE_DESC;
     else if (strcmp(opt + 1, "mp3") == 0)
-        return 2;
+        return FILETYPE_AUDIO;
     else
-        return -2;
+        return FILETYPE_UNSUPPORTED;
 }
 
 static int8_t get_chanalentry(const char* dir_path, uint8_t pos)
 {
     if (dir_path == NULL)
-        return -1;
+        return FILETYPE_UNKNOWN;
 
-    char pattern[256] = { 0 };
+    char pattern[GLOB_PATTERN_SIZE] = { 0 };
     glob_t glob_res;
     int i;
     int8_t ret;
 
-    snprintf(pattern, sizeof(pattern), "%s/*", dir_path);
+    snprintf(pattern, sizeof(pattern), "%s%s", dir_path, PATH_GLOB_SUFFIX);
 
     ret = glob(pattern, 0, NULL, &glob_res);
     if (ret != 0)
@@ -116,16 +130,16 @@ static int8_t get_chanalentry(const char* dir_path, uint8_t pos)
 
     if (chanal_buff[pos] != NULL)
     {
-        chanal_buff[pos]->chanal_id = pos + 1;
+        chanal_buff[pos]->chanal_id = pos + CHANNEL_ID_BASE;
     }
     else
     {
         globfree(&glob_res);
-        return -1;
+        return FILETYPE_UNKNOWN;
     }
 
     globfree(&glob_res);
-    return 1;
+    return FILETYPE_DESC;
 }
 
 static struct listentry_st* get_listentry(const char* dir_path, uint8_t pos)
@@ -137,14 +151,14 @@ static struct listentry_st* get_listentry(const char* dir_path, uint8_t pos)
 
     int8_t ret;
     glob_t glob_res;
-    char pattern[256];
+    char pattern[GLOB_PATTERN_SIZE];
     int i;
     char* filename;
     char* opt;
     struct listentry_st* ptr = NULL;
 
     memset(pattern, 0, sizeof(pattern));
-    snprintf(pattern, sizeof(pattern), "%s/*", dir_path);
+    snprintf(pattern, sizeof(pattern), "%s%s", dir_path, PATH_GLOB_SUFFIX);
 
     ret = glob(pattern, 0, NULL, &glob_res);
     if (ret != 0)
@@ -175,10 +189,10 @@ static struct listentry_st* get_listentry(const char* dir_path, uint8_t pos)
 
             memset(ptr, 0, MAX_LIST_ST);
 
-            ptr->chanal_id = pos + 1;
-            ptr->length = strlen(filename) - 1;
+            ptr->chanal_id = pos + CHANNEL_ID_BASE;
+            ptr->length = strlen(filename) - CHANNEL_ID_BASE;
 
-            strncpy(ptr->name, filename + 1, ptr->length);
+            strncpy(ptr->name, filename + CHANNEL_ID_BASE, ptr->length);
             ptr->name[ptr->length] = '\0';
         }
     }
@@ -194,12 +208,12 @@ void get_list(const char* dir_path)
         exit(1);
     }
 
-    char pattern[256];
+    char pattern[GLOB_PATTERN_SIZE];
     glob_t glob_res;
     int i;
     int8_t ret;
 
-    sprintf(pattern, "%s/*", dir_path);
+    snprintf(pattern, sizeof(pattern), "%s%s", dir_path, PATH_GLOB_SUFFIX);
 
     ret = glob(pattern, GLOB_ONLYDIR, NULL, &glob_res);
     if (ret != 0)
@@ -220,15 +234,15 @@ int8_t chanale_init(const char* dir_path)
 {
     if (dir_path == NULL)
     {
-        return -1;
+        return FILETYPE_UNKNOWN;
     }
 
-    char pattern[256];
+    char pattern[GLOB_PATTERN_SIZE];
     glob_t glob_res;
     int i;
     int8_t ret;
 
-    sprintf(pattern, "%s/*", dir_path);
+    snprintf(pattern, sizeof(pattern), "%s%s", dir_path, PATH_GLOB_SUFFIX);
 
     ret = glob(pattern, GLOB_ONLYDIR, NULL, &glob_res);
     if (ret != 0)
@@ -244,12 +258,12 @@ int8_t chanale_init(const char* dir_path)
         {
             fprintf(stdout, "%s error\n", glob_res.gl_pathv[i]);
             globfree(&glob_res);
-            return -1;
+            return FILETYPE_UNKNOWN;
         }
     }
 
     globfree(&glob_res);
-    return 1;
+    return FILETYPE_DESC;
 }
 
 void buff_destory(void)
@@ -280,7 +294,7 @@ int send_desc_packet(struct chanal_st* opt)
     buf[0] = opt->chanal_id;
     buf[1] = PKT_TYPE_DESC;
     memcpy(buf + 2, &net_desc_len, sizeof(net_desc_len));
-    buf[4] = 0;
+    buf[DESC_RESERVED_OFFSET] = DESC_RESERVED_VALUE;
 
     memcpy(buf + NET_DESC_HDR_LEN, opt->desc, opt->desc_len);
 
@@ -327,7 +341,7 @@ void* send_chanal(void* ptr)
     int read_len;
     char audio_buf[AUDIO_CHUNK_SIZE];
 
-    ch_id = opt->chanal_id - 1;
+    ch_id = opt->chanal_id - CHANNEL_ID_BASE;
 
     while (!server_stop)
     {
@@ -337,7 +351,7 @@ void* send_chanal(void* ptr)
         if (ret < 0)
         {
             perror("send_desc_packet()");
-            usleep(10000);
+            usleep(SEND_RETRY_INTERVAL_US);
         }
 
         fd = open(opt->game, O_RDONLY);
@@ -345,7 +359,7 @@ void* send_chanal(void* ptr)
         {
             fprintf(stderr, "open mp3 failed, chanal_id=%d path=%s\n",
                 opt->chanal_id, opt->game);
-            usleep(100000);
+            usleep(OPEN_RETRY_INTERVAL_US);
             continue;
         }
 
@@ -370,7 +384,7 @@ void* send_chanal(void* ptr)
                 if (ret < 0)
                 {
                     fprintf(stderr, "get_token error, chanal_id=%d\n", opt->chanal_id);
-                    usleep(10000);
+                    usleep(SEND_RETRY_INTERVAL_US);
                     continue;
                 }
             }
@@ -383,7 +397,7 @@ void* send_chanal(void* ptr)
             if (ret < 0)
             {
                 perror("send_audio_packet()");
-                usleep(10000);
+                usleep(SEND_RETRY_INTERVAL_US);
                 continue;
             }
 
@@ -412,7 +426,7 @@ int build_list_packet(char* buf, int buf_size)
     {
         int name_len = list_buff[i]->length;
 
-        if (pos + 1 + 2 + name_len > buf_size)
+        if (pos + LIST_ENTRY_FIXED_SIZE + name_len > buf_size)
             break;
 
         buf[pos++] = list_buff[i]->chanal_id;
@@ -427,4 +441,3 @@ int build_list_packet(char* buf, int buf_size)
 
     return pos;
 }
-

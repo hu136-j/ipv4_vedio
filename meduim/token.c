@@ -15,14 +15,16 @@
 #include <stdint.h>
 #include"token.h"
 
-#define TOKEN_MAXNUM 100
+#define TOKEN_MAXNUM             100
+#define TOKEN_SLOT_FREE          (-1)
+#define TOKEN_REFILL_INTERVAL_US 100000
 
 struct token_entyr
 {
     uint32_t brust_token;   // 桶容量上限
     uint32_t speed_token;   // 每秒补充多少令牌
     uint32_t my_token;      // 当前可用令牌数
-    int      pos_token;     // -1 表示空闲，其余表示所在槽位
+    int      pos_token;     // TOKEN_SLOT_FREE 表示空闲，其余表示所在槽位
     pthread_mutex_t token_mutex;
     pthread_cond_t  token_cond;
 };
@@ -38,10 +40,10 @@ static int find_free(void)
     int i;
     for (i = 0; i < TOKEN_MAXNUM; i++)
     {
-        if (token_buff[i].pos_token == -1)
+        if (token_buff[i].pos_token == TOKEN_SLOT_FREE)
             return i;
     }
-    return -1;
+    return TOKEN_SLOT_FREE;
 }
 
 /*
@@ -59,7 +61,7 @@ static void* gene_token(void* p)
 
         for (i = 0; i < TOKEN_MAXNUM; i++)
         {
-            if (token_buff[i].pos_token != -1)
+            if (token_buff[i].pos_token != TOKEN_SLOT_FREE)
             {
                 pthread_mutex_lock(&token_buff[i].token_mutex);
 
@@ -73,7 +75,7 @@ static void* gene_token(void* p)
         }
 
         pthread_mutex_unlock(&buff_mutex);
-        usleep(100000);
+        usleep(TOKEN_REFILL_INTERVAL_US);
     }
 
     return NULL;
@@ -88,7 +90,7 @@ static void buff_init(void)
         token_buff[i].brust_token = 0;
         token_buff[i].speed_token = 0;
         token_buff[i].my_token = 0;
-        token_buff[i].pos_token = -1;
+        token_buff[i].pos_token = TOKEN_SLOT_FREE;
     }
 }
 
@@ -102,11 +104,11 @@ static void moudle_destory(void)
 
     for (i = 0; i < TOKEN_MAXNUM; i++)
     {
-        if (token_buff[i].pos_token != -1)
+        if (token_buff[i].pos_token != TOKEN_SLOT_FREE)
         {
             pthread_mutex_destroy(&token_buff[i].token_mutex);
             pthread_cond_destroy(&token_buff[i].token_cond);
-            token_buff[i].pos_token = -1;
+            token_buff[i].pos_token = TOKEN_SLOT_FREE;
         }
     }
 }
@@ -170,7 +172,7 @@ void token_alldestry(struct token_entyr* ptr)
 
     pthread_mutex_lock(&buff_mutex);
 
-    if (ptr->pos_token != -1)
+    if (ptr->pos_token != TOKEN_SLOT_FREE)
     {
         pthread_mutex_destroy(&ptr->token_mutex);
         pthread_cond_destroy(&ptr->token_cond);
@@ -178,7 +180,7 @@ void token_alldestry(struct token_entyr* ptr)
         ptr->brust_token = 0;
         ptr->speed_token = 0;
         ptr->my_token = 0;
-        ptr->pos_token = -1;
+        ptr->pos_token = TOKEN_SLOT_FREE;
     }
 
     pthread_mutex_unlock(&buff_mutex);
@@ -196,7 +198,7 @@ int32_t get_token(struct token_entyr* ptr, uint32_t need_token)
 
     pthread_mutex_lock(&ptr->token_mutex);
 
-    if (ptr->pos_token == -1)
+    if (ptr->pos_token == TOKEN_SLOT_FREE)
     {
         fprintf(stdout, "token is free\n");
         pthread_mutex_unlock(&ptr->token_mutex);
@@ -232,7 +234,7 @@ int32_t ret_token(struct token_entyr* ptr, uint32_t ret_token_num)
 
     pthread_mutex_lock(&ptr->token_mutex);
 
-    if (ptr->pos_token == -1)
+    if (ptr->pos_token == TOKEN_SLOT_FREE)
     {
         fprintf(stdout, "token is free\n");
         pthread_mutex_unlock(&ptr->token_mutex);
