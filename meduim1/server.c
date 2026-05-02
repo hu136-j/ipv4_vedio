@@ -1,21 +1,28 @@
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <pthread.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <signal.h>
-#include <fcntl.h>
 #include <sys/stat.h>
-#include <limits.h>
+#include <sys/types.h>
+#include <unistd.h>
 
-#include "proto.h"
-#include "token.h"
 #include "meduim.h"
 
- volatile sig_atomic_t server_stop = 0;
+volatile sig_atomic_t server_stop = 0;
+
+struct server_options
+{
+    int daemon_mode;
+    uint16_t port;
+    const char *group;
+    const char *media_dir;
+};
 
 static void sig_handler(int signo)
 {
@@ -26,12 +33,100 @@ static void sig_handler(int signo)
 static void setup_signal(void)
 {
     struct sigaction sa;
+
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sig_handler;
     sigemptyset(&sa.sa_mask);
 
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+}
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+            "Usage: %s [-d] [-m media_dir] [-g multicast_group] [-p port]\n",
+            prog);
+}
+
+static int parse_port(const char *text, uint16_t *port)
+{
+    char *end = NULL;
+    long value;
+
+    if (text == NULL || port == NULL)
+        return -1;
+
+    value = strtol(text, &end, 10);
+    if (*text == '\0' || *end != '\0' || value < 1 || value > 65535)
+        return -1;
+
+    *port = (uint16_t)value;
+    return 0;
+}
+
+static int resolve_media_dir(const char *input_dir, char *resolved, size_t resolved_size)
+{
+    if (resolved == NULL || resolved_size == 0)
+        return -1;
+
+    if (input_dir != NULL)
+    {
+        if (realpath(input_dir, resolved) == NULL)
+            return -1;
+        return 0;
+    }
+
+    if (realpath("meduim_data", resolved) != NULL)
+        return 0;
+
+    if (realpath("./meduim1/meduim_data", resolved) != NULL)
+        return 0;
+
+    return -1;
+}
+
+static int parse_args(int argc, char *argv[], struct server_options *opts)
+{
+    int ch;
+
+    if (opts == NULL)
+        return -1;
+
+    memset(opts, 0, sizeof(*opts));
+    opts->group = MYGRUOP;
+    opts->media_dir = NULL;
+    if (parse_port(PORT, &opts->port) < 0)
+        return -1;
+
+    while ((ch = getopt(argc, argv, "dhm:g:p:")) != -1)
+    {
+        switch (ch)
+        {
+        case 'd':
+            opts->daemon_mode = 1;
+            break;
+        case 'm':
+            opts->media_dir = optarg;
+            break;
+        case 'g':
+            opts->group = optarg;
+            break;
+        case 'p':
+            if (parse_port(optarg, &opts->port) < 0)
+            {
+                fprintf(stderr, "invalid port: %s\n", optarg);
+                return -1;
+            }
+            break;
+        case 'h':
+        default:
+            usage(argv[0]);
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 static int daemonize(void)
@@ -73,73 +168,65 @@ static int daemonize(void)
 
 int main(int argc, char *argv[])
 {
-    char file_name[PATH_MAX];
+    char media_dir[PATH_MAX];
+    struct server_options opts;
+    int channel_count;
     int i;
     int ret;
-    int daemon_mode = 0;
     int thread_num = 0;
-    pthread_t tid[CHANAL_NUM] = {0};
+    pthread_t tid[CHANAL_NUM] = { 0 };
     char *send_buff_list = NULL;
-    int list_pkt_len;
+    int list_pkt_len = -1;
 
-    if (argc > 1 && strcmp(argv[1], "-d") == 0)
-        daemon_mode = 1;
+    if (parse_args(argc, argv, &opts) < 0)
+        exit(1);
 
-    if (realpath("meduim_data", file_name) == NULL &&
-        realpath("./meduim1/meduim_data", file_name) == NULL)
+    if (resolve_media_dir(opts.media_dir, media_dir, sizeof(media_dir)) < 0)
     {
-        perror("realpath meduim_data");
+        perror("resolve media_dir");
         exit(1);
     }
 
     setup_signal();
 
-    if (daemon_mode)
+    if (opts.daemon_mode && daemonize() < 0)
     {
-        if (daemonize() < 0)
-        {
-            perror("daemonize()");
-            exit(1);
-        }
+        perror("daemonize");
+        exit(1);
     }
 
-    get_list(file_name);
-    chanale_init(file_name);
+    channel_count = load_channels(media_dir);
+    if (channel_count <= 0)
+    {
+        fprintf(stderr, "no valid channels found in %s\n", media_dir);
+        buff_destory();
+        exit(1);
+    }
 
     sfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sfd < 0)
     {
-        perror("socket()");
+        perror("socket");
+        buff_destory();
         exit(1);
-    }
-
-    {
-        int val = 1;
-        ret = setsockopt(sfd, IPPROTO_IP, IP_MULTICAST_ALL, &val, sizeof(val));
-        if (ret < 0)
-        {
-            perror("setsockopt()");
-            close(sfd);
-            exit(1);
-        }
     }
 
     memset(&ser_sock, 0, sizeof(ser_sock));
     ser_sock.sin_family = AF_INET;
+    ser_sock.sin_port = htons(opts.port);
 
-    ret = inet_pton(AF_INET, MYGRUOP, &ser_sock.sin_addr.s_addr);
+    ret = inet_pton(AF_INET, opts.group, &ser_sock.sin_addr.s_addr);
     if (ret <= 0)
     {
-        fprintf(stderr, "inet_pton ip error\n");
+        fprintf(stderr, "invalid multicast group: %s\n", opts.group);
         close(sfd);
+        buff_destory();
         exit(1);
     }
 
-    ser_sock.sin_port = htons(atoi(PORT));
-
-    for (i = 0; i < CHANAL_NUM && chanal_buff[i] != NULL; i++)
+    for (i = 0; i < channel_count; i++)
     {
-        tbf_arr[i] = token_init(12288, 2000);
+        tbf_arr[i] = token_init(12288, 20000);
         if (tbf_arr[i] == NULL)
         {
             fprintf(stderr, "token_init failed for chanal %d\n", i + 1);
@@ -147,7 +234,7 @@ int main(int argc, char *argv[])
             break;
         }
 
-        ret = pthread_create(&tid[i], NULL, send_chanal, (void*)chanal_buff[i]);
+        ret = pthread_create(&tid[i], NULL, send_chanal, chanal_buff[i]);
         if (ret != 0)
         {
             fprintf(stderr, "pthread_create failed for chanal %d\n", i + 1);
@@ -160,7 +247,7 @@ int main(int argc, char *argv[])
         thread_num++;
     }
 
-    send_buff_list = malloc(sizeof(char) * MAX_LIST_ST);
+    send_buff_list = malloc(MAX_LIST_ST);
     if (send_buff_list == NULL)
     {
         fprintf(stderr, "malloc send_buff_list error\n");
@@ -180,7 +267,7 @@ int main(int argc, char *argv[])
     while (!server_stop)
     {
         ret = sendto(sfd, send_buff_list, list_pkt_len, 0,
-                     (struct sockaddr*)&ser_sock, sizeof(ser_sock));
+                     (struct sockaddr *)&ser_sock, sizeof(ser_sock));
         if (ret < 0)
             perror("sendto list");
 
@@ -192,15 +279,6 @@ int main(int argc, char *argv[])
     {
         if (tid[i] != 0)
             pthread_join(tid[i], NULL);
-    }
-
-    for (i = 0; i < CHANAL_NUM; i++)
-    {
-        if (tbf_arr[i] != NULL)
-        {
-            token_alldestry(tbf_arr[i]);
-            tbf_arr[i] = NULL;
-        }
     }
 
     free(send_buff_list);

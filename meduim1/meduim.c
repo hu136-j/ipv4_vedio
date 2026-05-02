@@ -1,280 +1,249 @@
-#include <glob.h>
-#include <stdio.h>
-#include "proto.h"
-#include "token.h"
-#include <string.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <arpa/inet.h>
-#include <pthread.h>
-#include <sys/types.h>
-#include <sys/socket.h>
+#include <fcntl.h>
+#include <glob.h>
+#include <limits.h>
 #include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include "meduim.h"
 
-struct chanal_st* chanal_buff[CHANAL_NUM] = { NULL };
-struct listentry_st* list_buff[CHANAL_NUM] = { NULL };
-struct token_entyr* tbf_arr[CHANAL_NUM] = { NULL };
+struct chanal_st *chanal_buff[CHANAL_NUM] = { NULL };
+struct listentry_st *list_buff[CHANAL_NUM] = { NULL };
+struct token_entyr *tbf_arr[CHANAL_NUM] = { NULL };
 int sfd;
 struct sockaddr_in ser_sock;
-char type_id[CHANAL_NUM] = { 0 };
 
-static struct chanal_st* get_filentry(glob_t* dir_path, char* file_type)
+static int has_extension(const char *path, const char *ext)
+{
+    const char *dot;
+
+    if (path == NULL || ext == NULL)
+        return 0;
+
+    dot = strrchr(path, '.');
+    if (dot == NULL)
+        return 0;
+
+    return strcmp(dot + 1, ext) == 0;
+}
+
+static struct listentry_st *alloc_listentry(uint8_t channel_id, const char *name)
+{
+    size_t name_len;
+    struct listentry_st *entry;
+
+    if (name == NULL)
+        return NULL;
+
+    name_len = strlen(name);
+    if (name_len == 0 || name_len > UINT16_MAX)
+        return NULL;
+
+    entry = malloc(sizeof(*entry) + name_len);
+    if (entry == NULL)
+        return NULL;
+
+    memset(entry, 0, sizeof(*entry) + name_len);
+    entry->chanal_id = channel_id;
+    entry->length = (uint16_t)name_len;
+    memcpy(entry->name, name, name_len);
+    entry->name[name_len] = '\0';
+
+    return entry;
+}
+
+static struct chanal_st *alloc_channel(uint8_t channel_id, const char *audio_path)
+{
+    size_t path_len;
+    struct chanal_st *channel;
+
+    if (audio_path == NULL)
+        return NULL;
+
+    path_len = strlen(audio_path);
+    if (path_len == 0 || path_len > MAX_GAME)
+        return NULL;
+
+    channel = malloc(sizeof(*channel) + path_len);
+    if (channel == NULL)
+        return NULL;
+
+    memset(channel, 0, sizeof(*channel) + path_len);
+    channel->chanal_id = channel_id;
+    channel->game_len = (uint32_t)path_len;
+    memcpy(channel->game, audio_path, path_len);
+    channel->game[path_len] = '\0';
+
+    return channel;
+}
+
+static int load_desc_file(const char *path, struct chanal_st *channel)
 {
     int fd;
-    int count;
-    char count1 = 0;
+    ssize_t len;
 
-    struct chanal_st* ptr = malloc(sizeof(char) * MAX_CHANAL_ST);
-    if (ptr == NULL)
-    {
-        return NULL;
-    }
+    if (path == NULL || channel == NULL)
+        return -1;
 
-    memset(ptr, 0, MAX_CHANAL_ST);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
 
-    while (*file_type != 0)
-    {
-        if (*file_type == 1)
-        {
-            fd = open(dir_path->gl_pathv[(int)count1], O_RDONLY);
-            if (fd < 0)
-            {
-                free(ptr);
-                return NULL;
-            }
+    len = read(fd, channel->desc, DESC_MAX);
+    close(fd);
 
-            count = read(fd, ptr->desc, DESC_MAX);
-            if (count < 0)
-            {
-                close(fd);
-                free(ptr);
-                return NULL;
-            }
+    if (len < 0)
+        return -1;
 
-            ptr->desc_len = count;
-            close(fd);
-        }
-        else if (*file_type == 2)
-        {
-            strncpy(ptr->game, dir_path->gl_pathv[(int)count1], MAX_GAME - 1);
-            ptr->game[MAX_GAME - 1] = '\0';
-            ptr->game_len = 0;
-        }
-
-        file_type++;
-        count1++;
-    }
-
-    return ptr;
+    channel->desc_len = (uint16_t)len;
+    return 0;
 }
 
-static int8_t get_filetype(const char* dir_path)
+static int load_channel_dir(const char *dir_path, uint8_t channel_id)
 {
-    if (dir_path == NULL)
-        return -1;
-
-    const char* opt = strrchr(dir_path, '.');
-    if (opt == NULL)
-        return -1;
-
-    if (strcmp(opt + 1, "txt") == 0)
-        return 1;
-    else if (strcmp(opt + 1, "mp3") == 0)
-        return 2;
-    else
-        return -2;
-}
-
-static int8_t get_chanalentry(const char* dir_path, uint8_t pos)
-{
-    if (dir_path == NULL)
-        return -1;
-
-    char pattern[256] = { 0 };
+    char pattern[PATH_MAX];
     glob_t glob_res;
-    int i;
-    int8_t ret;
+    char *audio_path = NULL;
+    char *desc_path = NULL;
+    size_t i;
+    int ret;
+    const char *audio_name;
+    struct chanal_st *channel = NULL;
+    struct listentry_st *entry = NULL;
 
-    snprintf(pattern, sizeof(pattern), "%s/*", dir_path);
+    if (dir_path == NULL)
+        return -1;
+
+    ret = snprintf(pattern, sizeof(pattern), "%s/*", dir_path);
+    if (ret < 0 || (size_t)ret >= sizeof(pattern))
+        return -1;
 
     ret = glob(pattern, 0, NULL, &glob_res);
     if (ret != 0)
+        return -1;
+
+    for (i = 0; i < glob_res.gl_pathc; i++)
     {
-        perror("get_chanalentry glob()");
-        exit(1);
+        if (audio_path == NULL && has_extension(glob_res.gl_pathv[i], "mp3"))
+            audio_path = glob_res.gl_pathv[i];
+        else if (desc_path == NULL && has_extension(glob_res.gl_pathv[i], "txt"))
+            desc_path = glob_res.gl_pathv[i];
     }
 
-    memset(type_id, 0, sizeof(type_id));
-
-    for (i = 0; i < (int)glob_res.gl_pathc && i < CHANAL_NUM; i++)
+    if (audio_path == NULL)
     {
-        type_id[i] = get_filetype(glob_res.gl_pathv[i]);
+        globfree(&glob_res);
+        return 0;
     }
 
-    chanal_buff[pos] = get_filentry(&glob_res, type_id);
-
-    if (chanal_buff[pos] != NULL)
-    {
-        chanal_buff[pos]->chanal_id = pos + 1;
-    }
+    audio_name = strrchr(audio_path, '/');
+    if (audio_name == NULL)
+        audio_name = audio_path;
     else
+        audio_name++;
+
+    channel = alloc_channel(channel_id, audio_path);
+    entry = alloc_listentry(channel_id, audio_name);
+    if (channel == NULL || entry == NULL)
     {
+        free(channel);
+        free(entry);
         globfree(&glob_res);
         return -1;
     }
 
-    globfree(&glob_res);
-    return 1;
-}
-
-static struct listentry_st* get_listentry(const char* dir_path, uint8_t pos)
-{
-    if (dir_path == NULL)
+    if (desc_path != NULL && load_desc_file(desc_path, channel) < 0)
     {
-        return NULL;
-    }
-
-    int8_t ret;
-    glob_t glob_res;
-    char pattern[256];
-    int i;
-    char* filename;
-    char* opt;
-    struct listentry_st* ptr = NULL;
-
-    memset(pattern, 0, sizeof(pattern));
-    snprintf(pattern, sizeof(pattern), "%s/*", dir_path);
-
-    ret = glob(pattern, 0, NULL, &glob_res);
-    if (ret != 0)
-    {
-        perror("get_listentry glob()");
-        exit(1);
-    }
-
-    for (i = 0; i < (int)glob_res.gl_pathc; i++)
-    {
-        filename = strrchr(glob_res.gl_pathv[i], '/');
-        if (filename == NULL)
-            continue;
-
-        opt = strrchr(filename, '.');
-        if (opt == NULL)
-            continue;
-
-        if (strcmp(opt + 1, "mp3") == 0)
-        {
-            ptr = malloc(sizeof(uint8_t) * MAX_LIST_ST);
-            if (ptr == NULL)
-            {
-                fprintf(stderr, "listentry malloc error\n");
-                globfree(&glob_res);
-                exit(1);
-            }
-
-            memset(ptr, 0, MAX_LIST_ST);
-
-            ptr->chanal_id = pos + 1;
-            ptr->length = strlen(filename) - 1;
-
-            strncpy(ptr->name, filename + 1, ptr->length);
-            ptr->name[ptr->length] = '\0';
-        }
-    }
-
-    globfree(&glob_res);
-    return ptr;
-}
-
-void get_list(const char* dir_path)
-{
-    if (dir_path == NULL)
-    {
-        exit(1);
-    }
-
-    char pattern[256];
-    glob_t glob_res;
-    int i;
-    int8_t ret;
-
-    sprintf(pattern, "%s/*", dir_path);
-
-    ret = glob(pattern, GLOB_ONLYDIR, NULL, &glob_res);
-    if (ret != 0)
-    {
-        perror("get_list glob()");
-        exit(1);
-    }
-
-    for (i = 0; i < (int)glob_res.gl_pathc && i < CHANAL_NUM; i++)
-    {
-        list_buff[i] = get_listentry(glob_res.gl_pathv[i], i);
-    }
-
-    globfree(&glob_res);
-}
-
-int8_t chanale_init(const char* dir_path)
-{
-    if (dir_path == NULL)
-    {
+        free(channel);
+        free(entry);
+        globfree(&glob_res);
         return -1;
     }
 
-    char pattern[256];
-    glob_t glob_res;
-    int i;
-    int8_t ret;
-
-    sprintf(pattern, "%s/*", dir_path);
-
-    ret = glob(pattern, GLOB_ONLYDIR, NULL, &glob_res);
-    if (ret != 0)
-    {
-        perror("chanale_init glob()");
-        exit(1);
-    }
-
-    for (i = 0; i < (int)glob_res.gl_pathc && i < CHANAL_NUM; i++)
-    {
-        ret = get_chanalentry(glob_res.gl_pathv[i], i);
-        if (ret < 0)
-        {
-            fprintf(stdout, "%s error\n", glob_res.gl_pathv[i]);
-            globfree(&glob_res);
-            return -1;
-        }
-    }
+    chanal_buff[channel_id - 1] = channel;
+    list_buff[channel_id - 1] = entry;
 
     globfree(&glob_res);
     return 1;
+}
+
+int load_channels(const char *dir_path)
+{
+    char pattern[PATH_MAX];
+    glob_t glob_res;
+    size_t i;
+    int ret;
+    int channel_count = 0;
+
+    if (dir_path == NULL)
+        return -1;
+
+    ret = snprintf(pattern, sizeof(pattern), "%s/*", dir_path);
+    if (ret < 0 || (size_t)ret >= sizeof(pattern))
+        return -1;
+
+    ret = glob(pattern, GLOB_ONLYDIR, NULL, &glob_res);
+    if (ret != 0)
+        return -1;
+
+    for (i = 0; i < glob_res.gl_pathc && channel_count < MAX_CHANAL_ID; i++)
+    {
+        int load_ret;
+
+        load_ret = load_channel_dir(glob_res.gl_pathv[i], (uint8_t)(channel_count + 1));
+        if (load_ret < 0)
+        {
+            globfree(&glob_res);
+            return -1;
+        }
+
+        if (load_ret == 0)
+        {
+            fprintf(stderr, "skip invalid channel dir: %s\n", glob_res.gl_pathv[i]);
+            continue;
+        }
+
+        channel_count++;
+    }
+
+    globfree(&glob_res);
+    return channel_count;
 }
 
 void buff_destory(void)
 {
     int i;
+
     for (i = 0; i < CHANAL_NUM; i++)
     {
-        if (list_buff[i] != NULL)
-            free(list_buff[i]);
+        free(list_buff[i]);
+        list_buff[i] = NULL;
 
-        if (chanal_buff[i] != NULL)
-            free(chanal_buff[i]);
+        free(chanal_buff[i]);
+        chanal_buff[i] = NULL;
 
         if (tbf_arr[i] != NULL)
+        {
             token_alldestry(tbf_arr[i]);
+            tbf_arr[i] = NULL;
+        }
     }
 }
 
-int send_desc_packet(struct chanal_st* opt)
+int send_desc_packet(struct chanal_st *opt)
 {
     char buf[NET_DESC_HDR_LEN + DESC_MAX];
     uint16_t net_desc_len;
     int pkt_len;
-    int ret;
+
+    if (opt == NULL)
+        return -1;
 
     net_desc_len = htons(opt->desc_len);
 
@@ -282,25 +251,25 @@ int send_desc_packet(struct chanal_st* opt)
     buf[1] = PKT_TYPE_DESC;
     memcpy(buf + 2, &net_desc_len, sizeof(net_desc_len));
     buf[4] = 0;
-
     memcpy(buf + NET_DESC_HDR_LEN, opt->desc, opt->desc_len);
 
     pkt_len = NET_DESC_HDR_LEN + opt->desc_len;
 
-    ret = sendto(sfd, buf, pkt_len, 0,
-        (struct sockaddr*)&ser_sock, sizeof(ser_sock));
-    return ret;
+    return sendto(sfd, buf, pkt_len, 0,
+                  (struct sockaddr *)&ser_sock, sizeof(ser_sock));
 }
 
-int send_audio_packet(struct chanal_st* opt, uint32_t stream_epoch, uint32_t seq,
-    const char* payload, uint16_t payload_len)
+int send_audio_packet(struct chanal_st *opt, uint32_t stream_epoch, uint32_t seq,
+                      const char *payload, uint16_t payload_len)
 {
     char buf[NET_AUDIO_HDR_LEN + AUDIO_CHUNK_SIZE];
     uint32_t net_epoch;
     uint32_t net_seq;
     uint16_t net_payload_len;
     int pkt_len;
-    int ret;
+
+    if (opt == NULL || payload == NULL || payload_len > AUDIO_CHUNK_SIZE)
+        return -1;
 
     net_epoch = htonl(stream_epoch);
     net_seq = htonl(seq);
@@ -311,26 +280,27 @@ int send_audio_packet(struct chanal_st* opt, uint32_t stream_epoch, uint32_t seq
     memcpy(buf + 2, &net_epoch, sizeof(net_epoch));
     memcpy(buf + 6, &net_seq, sizeof(net_seq));
     memcpy(buf + 10, &net_payload_len, sizeof(net_payload_len));
-
     memcpy(buf + NET_AUDIO_HDR_LEN, payload, payload_len);
 
     pkt_len = NET_AUDIO_HDR_LEN + payload_len;
 
-    ret = sendto(sfd, buf, pkt_len, 0,
-        (struct sockaddr*)&ser_sock, sizeof(ser_sock));
-    return ret;
+    return sendto(sfd, buf, pkt_len, 0,
+                  (struct sockaddr *)&ser_sock, sizeof(ser_sock));
 }
 
-void* send_chanal(void* ptr)
+void *send_chanal(void *ptr)
 {
-    struct chanal_st* opt = ptr;
+    struct chanal_st *opt = ptr;
     uint32_t stream_epoch = 0;
     uint32_t seq = 0;
     int ch_id;
     int ret;
     int fd;
-    int read_len;
+    ssize_t read_len;
     char audio_buf[AUDIO_CHUNK_SIZE];
+
+    if (opt == NULL)
+        return NULL;
 
     ch_id = opt->chanal_id - 1;
 
@@ -339,7 +309,7 @@ void* send_chanal(void* ptr)
         ret = send_desc_packet(opt);
         if (ret < 0)
         {
-            perror("send_desc_packet()");
+            perror("send_desc_packet");
             usleep(10000);
         }
 
@@ -347,7 +317,7 @@ void* send_chanal(void* ptr)
         if (fd < 0)
         {
             fprintf(stderr, "open mp3 failed, chanal_id=%d path=%s\n",
-                opt->chanal_id, opt->game);
+                    opt->chanal_id, opt->game);
             usleep(100000);
             continue;
         }
@@ -357,16 +327,14 @@ void* send_chanal(void* ptr)
 
         while (!server_stop)
         {
-            read_len = read(fd, audio_buf, AUDIO_CHUNK_SIZE);
+            read_len = read(fd, audio_buf, sizeof(audio_buf));
             if (read_len < 0)
             {
                 perror("read mp3");
                 break;
             }
             if (read_len == 0)
-            {
                 break;
-            }
 
             if (ch_id >= 0 && ch_id < CHANAL_NUM && tbf_arr[ch_id] != NULL)
             {
@@ -379,10 +347,11 @@ void* send_chanal(void* ptr)
                 }
             }
 
-            ret = send_audio_packet(opt, stream_epoch, seq, audio_buf, (uint16_t)read_len);
+            ret = send_audio_packet(opt, stream_epoch, seq,
+                                    audio_buf, (uint16_t)read_len);
             if (ret < 0)
             {
-                perror("send_audio_packet()");
+                perror("send_audio_packet");
                 usleep(10000);
                 continue;
             }
@@ -396,13 +365,13 @@ void* send_chanal(void* ptr)
     return NULL;
 }
 
-int build_list_packet(char* buf, int buf_size)
+int build_list_packet(char *buf, int buf_size)
 {
     int i;
     int pos = 0;
     uint16_t net_len;
 
-    if (buf_size < NET_LIST_HDR_LEN)
+    if (buf == NULL || buf_size < NET_LIST_HDR_LEN)
         return -1;
 
     buf[pos++] = LIST_ID;
@@ -417,7 +386,7 @@ int build_list_packet(char* buf, int buf_size)
 
         buf[pos++] = list_buff[i]->chanal_id;
 
-        net_len = htons(name_len);
+        net_len = htons((uint16_t)name_len);
         memcpy(buf + pos, &net_len, sizeof(net_len));
         pos += sizeof(net_len);
 
@@ -427,4 +396,3 @@ int build_list_packet(char* buf, int buf_size)
 
     return pos;
 }
-

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
@@ -59,8 +60,9 @@ struct outbuf
 struct optentry
 {
     uint16_t port;
-    uint32_t ip;
-    char *player_path;
+    const char *group;
+    const char *player_path;
+    int channel_id;
 };
 
 struct fd_ctx
@@ -74,6 +76,97 @@ static int g_pipe_wfd = -1;
 static struct outbuf g_outbuf;
 
 /* ======================= 工具函数 ======================= */
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+            "Usage: %s [-g multicast_group] [-p port] [-P player] [-c channel_id]\n",
+            prog);
+}
+
+static int parse_port(const char *text, uint16_t *port)
+{
+    char *end = NULL;
+    long value;
+
+    if (text == NULL || port == NULL)
+        return -1;
+
+    value = strtol(text, &end, 10);
+    if (*text == '\0' || *end != '\0' || value < 1 || value > 65535)
+        return -1;
+
+    *port = (uint16_t)value;
+    return 0;
+}
+
+static int parse_channel_id(const char *text, int *channel_id)
+{
+    char *end = NULL;
+    long value;
+
+    if (text == NULL || channel_id == NULL)
+        return -1;
+
+    value = strtol(text, &end, 10);
+    if (*text == '\0' || *end != '\0' ||
+        value < MIN_CHANAL_ID || value > MAX_CHANAL_ID)
+    {
+        return -1;
+    }
+
+    *channel_id = (int)value;
+    return 0;
+}
+
+static int parse_args(int argc, char *argv[], struct optentry *optentry_st)
+{
+    int ch;
+
+    if (optentry_st == NULL)
+        return -1;
+
+    memset(optentry_st, 0, sizeof(*optentry_st));
+    optentry_st->group = MYGRUOP;
+    optentry_st->player_path = "mpg123";
+    optentry_st->channel_id = 0;
+
+    if (parse_port(PORT, &optentry_st->port) < 0)
+        return -1;
+
+    while ((ch = getopt(argc, argv, "hg:p:P:c:")) != -1)
+    {
+        switch (ch)
+        {
+        case 'g':
+            optentry_st->group = optarg;
+            break;
+        case 'p':
+            if (parse_port(optarg, &optentry_st->port) < 0)
+            {
+                fprintf(stderr, "invalid port: %s\n", optarg);
+                return -1;
+            }
+            break;
+        case 'P':
+            optentry_st->player_path = optarg;
+            break;
+        case 'c':
+            if (parse_channel_id(optarg, &optentry_st->channel_id) < 0)
+            {
+                fprintf(stderr, "invalid channel id: %s\n", optarg);
+                return -1;
+            }
+            break;
+        case 'h':
+        default:
+            usage(argv[0]);
+            return -1;
+        }
+    }
+
+    return 0;
+}
 
 static int set_nonblock(int fd)
 {
@@ -516,8 +609,8 @@ int main(int argc, char *argv[])
     struct sockaddr_in laddr;
     struct ip_mreqn mreq;
     char *recv_buf = NULL;
-    int pipefd[2];
-    pid_t pid;
+    int pipefd[2] = { -1, -1 };
+    pid_t pid = -1;
     int read_num;
     int id_choose;
     int desc_printed = 0;
@@ -525,14 +618,10 @@ int main(int argc, char *argv[])
     struct fd_ctx sock_ctx;
     struct fd_ctx pipe_ctx;
 
-    (void)argc;
-    (void)argv;
-
     signal(SIGPIPE, SIG_IGN);
 
-    memset(&optentry_st, 0, sizeof(optentry_st));
-    optentry_st.port = atoi(PORT);
-    optentry_st.player_path = "mpg123";
+    if (parse_args(argc, argv, &optentry_st) < 0)
+        exit(1);
 
     sfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sfd < 0)
@@ -566,10 +655,10 @@ int main(int argc, char *argv[])
     }
 
     memset(&mreq, 0, sizeof(mreq));
-    ret = inet_pton(AF_INET, MYGRUOP, &mreq.imr_multiaddr.s_addr);
+    ret = inet_pton(AF_INET, optentry_st.group, &mreq.imr_multiaddr.s_addr);
     if (ret <= 0)
     {
-        fprintf(stderr, "inet_pton() group ip error\n");
+        fprintf(stderr, "inet_pton() group ip error: %s\n", optentry_st.group);
         close(sfd);
         exit(1);
     }
@@ -603,7 +692,12 @@ int main(int argc, char *argv[])
     printf("choose id: ");
     fflush(stdout);
 
-    if (scanf("%d", &id_choose) != 1)
+    if (optentry_st.channel_id != 0)
+    {
+        id_choose = optentry_st.channel_id;
+        printf("%d\n", id_choose);
+    }
+    else if (scanf("%d", &id_choose) != 1)
     {
         fprintf(stderr, "scanf choose id error\n");
         free(recv_buf);
@@ -817,8 +911,15 @@ int main(int argc, char *argv[])
     }
 
 out:
+    if (pid > 0)
+    {
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+    }
     if (g_epfd >= 0)
         close(g_epfd);
+    if (pipefd[0] >= 0)
+        close(pipefd[0]);
     if (pipefd[1] >= 0)
         close(pipefd[1]);
     if (sfd >= 0)

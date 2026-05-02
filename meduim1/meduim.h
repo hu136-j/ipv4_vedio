@@ -15,8 +15,7 @@ extern struct sockaddr_in ser_sock;
 
 extern volatile sig_atomic_t server_stop;
 
-void get_list(const char* dir_path);
-int8_t chanale_init(const char* dir_path);
+int load_channels(const char* dir_path);
 void buff_destory(void);
 
 int send_desc_packet(struct chanal_st* opt);
@@ -27,4 +26,3 @@ void* send_chanal(void* ptr);
 int build_list_packet(char* buf, int buf_size);
 
 #endif
-
