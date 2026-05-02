@@ -15,14 +15,18 @@ extern struct sockaddr_in ser_sock;
 
 extern volatile sig_atomic_t server_stop;
 
-int load_channels(const char* dir_path);
+
+
+void get_list(const char* dir_path);
+int8_t chanale_init(const char* dir_path);
 void buff_destory(void);
 
 int send_desc_packet(struct chanal_st* opt);
-int send_audio_packet(struct chanal_st* opt, uint32_t stream_epoch, uint32_t seq,
+int send_audio_packet(struct chanal_st* opt, uint32_t seq,
     const char* payload, uint16_t payload_len);
 void* send_chanal(void* ptr);
 
 int build_list_packet(char* buf, int buf_size);
 
 #endif
+

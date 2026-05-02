@@ -27,7 +27,6 @@ struct chanal_st
     uint8_t  chanal_id;
     uint16_t desc_len;
     char     desc[DESC_MAX];
-    uint32_t bitrate_bytes_per_sec;
     uint32_t game_len;
     char     game[1];
 } __attribute__((packed));
@@ -47,6 +46,8 @@ struct list_st
     struct listentry_st entry[1];
 } __attribute__((packed));
 
+/* ---------------- 新增：网络分片发送协议 ---------------- */
+
 /* 包类型 */
 #define PKT_TYPE_LIST   1
 #define PKT_TYPE_DESC   2
@@ -58,6 +59,6 @@ struct list_st
 /* 线上的头字段长度（手动拼包，不直接发结构体） */
 #define NET_LIST_HDR_LEN   2   /* chanal_id(1) + pkt_type(1) */
 #define NET_DESC_HDR_LEN   5   /* chanal_id(1) + pkt_type(1) + desc_len(2) + reserved(1) */
-#define NET_AUDIO_HDR_LEN  12  /* chanal_id(1) + pkt_type(1) + stream_epoch(4) + seq(4) + payload_len(2) */
+#define NET_AUDIO_HDR_LEN  8   /* chanal_id(1) + pkt_type(1) + seq(4) + payload_len(2) */
 
 #endif

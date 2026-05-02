@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -I../meduim1
+CFLAGS = -Wall -Wextra -O2 -I../meduim
 LDFLAGS = -pthread
 TARGET = clinet
 SRC = client.c
